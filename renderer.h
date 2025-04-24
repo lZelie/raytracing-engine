@@ -3,6 +3,7 @@
 #include <memory>
 
 #include "camera.h"
+#include "compute_renderer.h"
 #include "scene_data.h"
 #include "vao.h"
 #include "GLFW/glfw3.h"
@@ -18,28 +19,32 @@ constexpr int FPS_UPDATE_DELAY = 1;
 namespace gl3
 {
     class renderer {
-    private:
-        GLFWwindow* window;
-        float cameraFov;
-        gl3::camera camera;
+        GLFWwindow* window = nullptr;
+        float camera_fov = CAMERA_FOV;
+        camera camera{INITIAL_WIDTH, INITIAL_HEIGHT, {0.0f, 1.0f, 1.0f}};
 
         // Scene data manager
         scene_data scene_data;
     
         // ImGui state
-        bool show_ui;
-        bool camera_mode;
+        bool show_ui = true;
+        bool camera_mode = false;
+        bool use_compute_shader = false; // Flag to toggle between compute and fragment shader
 
         // Rendering state
-        std::unique_ptr<gl3::shader_class> shader_program;
-        std::unique_ptr<gl3::vao> quad_VAO;
-        std::unique_ptr<gl3::vbo> quad_VBO;
+        std::unique_ptr<shader_class> shader_program;
+        std::unique_ptr<vao> quad_VAO;
+        std::unique_ptr<vbo> quad_VBO;
+
+        // Compute shader approach
+        std::unique_ptr<compute_renderer> compute_rend;
+        
         unsigned frame_acc = 0;
         double prev_fps_update = 0;
         double current_FPS = 0;
         void update_fps();
     
-        // Initialize GLFW and create window
+        // Initialize GLFW and create the window
         void init_window();
 
         // Initialize ImGui

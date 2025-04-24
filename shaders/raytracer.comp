@@ -1,0 +1,812 @@
+#version 460 core
+
+// Define local workgroup size
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Camera UBO
+layout (std140, binding = 0) uniform CameraBlock {
+    vec2 windowSize;
+    vec3 cameraPosition;
+    vec3 cameraTarget;
+    float cameraFov;
+    float exposure_time;
+    int time_samples;
+    float focalDistance;
+    float apertureSize;
+} camera;
+
+// Scene Objects UBO
+struct Material {
+    vec3 diffuse;
+    vec3 specular;
+    vec3 ambient;
+    float shininess;
+    float reflection_coef;
+    float refraction_coef;
+    float refraction_index;
+    float glossiness;
+    vec3 absorption;
+};
+
+struct Sphere {
+    vec3 position;
+    float radius;
+    vec3 velocity;
+};
+
+layout (std140, binding = 1) uniform ObjectsBlock {
+    Sphere spheres[256];
+    vec3 planes[256];
+    vec3 triangles[768];
+    vec4 csgSpheres[4];
+    int numSpheres;
+    int numPlanes;
+    int numTriangles;
+    Material sphere_materials[256];
+    Material plane_materials[128];
+    Material triangle_materials[256];
+    Material csg_sphere_materials[4];
+} objects;
+
+// Lighting UBO
+layout (std140, binding = 2) uniform LightingBlock {
+    vec4 lightPosition;// xyz position, w intensity
+    vec3 lightColor;
+    vec3 ambientLight;
+    int lightType;
+    int sampleRate;
+    uint recursionDepth;
+    bool use_fresnel;
+    float light_radius;
+    int shadow_samples;
+} lighting;
+
+layout(rgba32f, binding = 0) uniform image2D outputImage;
+
+// Ray and Hit structures
+struct Ray {
+    vec3 origin;
+    vec3 direction;
+    vec3 mask;
+    float current_ior;
+    int depth;
+    bool is_active;
+};
+
+struct Hit {
+    float distance;
+    vec3 surface_normal;
+    int surface_material_index;
+};
+
+struct Roth {
+    int nb_hits;
+    Hit hits[8];
+};
+
+// Random number generation
+int seed = 0;
+
+int xorshift(int value) {
+    value ^= value << 13;
+    value ^= value >> 17;
+    value ^= value << 5;
+    return value;
+}
+
+float random() {
+    seed = xorshift(seed);
+    return abs(fract(float(seed) / 3141.592653589793238));
+}
+
+// Function to create a random direction in the hemisphere around a normal
+vec3 random_hemisphere_direction(vec3 normal) {
+    float theta = 2.0f * 3.14159265359f * random();
+    float phi = acos(2.0f * random() - 1.0f);
+
+    vec3 random_dir = vec3(sin(phi) * cos(theta), sin(phi) * sin(phi), cos(phi));
+
+    if (dot(random_dir, normal) < 0.0f) {
+        random_dir = -random_dir;
+    }
+
+    return normalize(random_dir);
+}
+
+// Generate a random point on a disk
+vec2 random_disk() {
+    float r = sqrt(random());
+    float theta = 2.0 * 3.14159265359 * random();
+    return vec2(r * cos(theta), r * sin(theta));
+}
+
+// Ray-Sphere intersection
+float ray_sphere(vec3 ray_pos, vec3 ray_dir, int sphere_index, float time, out vec3 intersect_pt, out vec3 normal) {
+    vec3 sphere_pos = objects.spheres[sphere_index].position + objects.spheres[sphere_index].velocity * time;
+    vec3 oc = ray_pos - sphere_pos;
+
+    float a = dot(ray_dir, ray_dir);
+    float b = 2.0 * dot(oc, ray_dir);
+    float c = dot(oc, oc) - objects.spheres[sphere_index].radius * objects.spheres[sphere_index].radius;
+
+    float discriminant = b * b - 4.0 * a * c;
+
+    if (discriminant < 0.0) {
+        return -2.0;// No intersection
+    }
+
+    float t = (-b - sqrt(discriminant)) / (2.0 * a);
+
+    if (t < 0.0) {
+        t = (-b + sqrt(discriminant)) / (2.0 * a);
+        if (t < 0.0) {
+            return -1.0;// Both intersections are behind the ray
+        }
+    }
+
+    intersect_pt = ray_pos + t * ray_dir;
+    normal = normalize(intersect_pt - sphere_pos);
+
+    return t;
+}
+
+// Ray-Triangle intersection
+float ray_triangle(vec3 ray_pos, vec3 ray_dir, vec3 p0, vec3 p1, vec3 p2, out vec3 intersect_pt, out vec3 normal) {
+    vec3 edge1 = p1 - p0;
+    vec3 edge2 = p2 - p0;
+    normal = normalize(cross(edge1, edge2));
+
+    float ndotray = dot(normal, ray_dir);
+    if (abs(ndotray) < 0.000001)
+    return -1.0;// They are parallel, no intersection
+
+    float d = dot(normal, p0);
+    float t = (dot(normal, ray_pos) - d) / -ndotray;
+
+    if (t < 0.0)
+    return -1.0;
+
+    intersect_pt = ray_pos + t * ray_dir;
+
+    vec3 c0 = cross(p1 - intersect_pt, p2 - intersect_pt);
+    vec3 c1 = cross(p2 - intersect_pt, p0 - intersect_pt);
+    vec3 c2 = cross(p0 - intersect_pt, p1 - intersect_pt);
+
+    if (dot(normal, c0) < 0.0 || dot(normal, c1) < 0.0 || dot(normal, c2) < 0.0)
+    return -1.0;
+
+    return t;
+}
+
+// Ray-Plane intersection
+float ray_plane(vec3 ray_pos, vec3 ray_dir, vec3 plane_pos, vec3 plane_normal, out vec3 intersec_pt, out vec3 normal) {
+    plane_normal = normalize(plane_normal);
+
+    float denom = dot(plane_normal, ray_dir);
+    if (abs(denom) < 0.000001) {
+        return -1.0;// No intersection, ray is parallel to plane
+    }
+
+    float t = dot(plane_normal, plane_pos - ray_pos) / denom;
+
+    if (t < 0.0) {
+        return -1.0;
+    }
+
+    intersec_pt = ray_pos + t * ray_dir;
+    normal = denom < 0.0 ? plane_normal : -plane_normal;
+
+    return t;
+}
+
+Roth ray_sphere_roth(vec3 ray_pos, vec3 ray_dir, vec3 sphere_pos, float sphere_radius, int material_index) {
+    Roth result;
+    result.nb_hits = 0;
+
+    vec3 oc = ray_pos - sphere_pos;
+
+    float a = dot(ray_dir, ray_dir);
+    float b = 2.0 * dot(oc, ray_dir);
+    float c = dot(oc, oc) - sphere_radius * sphere_radius;
+
+    float discriminant = b * b - 4.0 * a * c;
+
+    if (discriminant < 0.0) {
+        return result;// No intersection
+    }
+
+    // Calculate the two intersection distances
+    float t1 = (-b - sqrt(discriminant)) / (2.0 * a);
+    float t2 = (-b + sqrt(discriminant)) / (2.0 * a);
+
+    // Add entry point
+    vec3 intersect_pt1 = ray_pos + t1 * ray_dir;
+    vec3 normal1 = normalize(intersect_pt1 - sphere_pos);
+
+    result.hits[result.nb_hits].distance = t1;
+    result.hits[result.nb_hits].surface_normal = normal1;
+    result.hits[result.nb_hits].surface_material_index = material_index;
+    result.nb_hits++;
+
+    // Add exit point
+    vec3 intersect_pt2 = ray_pos + t2 * ray_dir;
+    vec3 normal2 = normalize(intersect_pt2 - sphere_pos);
+
+    result.hits[result.nb_hits].distance = t2;
+    result.hits[result.nb_hits].surface_normal = -normal2;// Negative normal for exit point
+    result.hits[result.nb_hits].surface_material_index = material_index;
+    result.nb_hits++;
+
+    return result;
+}
+
+// Union operation: Combines two objects, returns all intersection points sorted by distance
+Roth unionCSG(Roth roth1, Roth roth2) {
+    Roth result;
+    result.nb_hits = 0;
+
+    int i = 0, j = 0;
+
+    // Merge hits from both roths, keeping them ordered by distance
+    int inside_count = 0;
+    while (i < roth1.nb_hits && j < roth2.nb_hits && result.nb_hits < 8) {
+        if (roth1.hits[i].distance < roth2.hits[j].distance) {
+            if (i % 2 != 0) {
+                if (inside_count == 1) {
+                    result.hits[result.nb_hits] = roth1.hits[i];
+                    result.nb_hits++;
+                }
+                inside_count--;
+            }
+            else {
+                if (inside_count == 0) {
+                    result.hits[result.nb_hits] = roth1.hits[i];
+                    result.nb_hits++;
+                }
+                inside_count++;
+            }
+            i++;
+        } else {
+            if (j % 2 != 0) {
+                if (inside_count == 1) {
+                    result.hits[result.nb_hits] = roth2.hits[j];
+                    result.nb_hits++;
+                }
+                inside_count--;
+            }
+            else {
+                if (inside_count == 0) {
+                    result.hits[result.nb_hits] = roth2.hits[j];
+                    result.nb_hits++;
+                }
+                inside_count++;
+            }
+            j++;
+        }
+    }
+
+    // Add remaining hits from roth1
+    while (i < roth1.nb_hits && result.nb_hits < 8) {
+        result.hits[result.nb_hits] = roth1.hits[i];
+        i++;
+        result.nb_hits++;
+    }
+
+    // Add remaining hits from roth2
+    while (j < roth2.nb_hits && result.nb_hits < 8) {
+        result.hits[result.nb_hits] = roth2.hits[j];
+        j++;
+        result.nb_hits++;
+    }
+
+    return result;
+}
+
+// Intersection operation: Returns intersection points where both objects overlap
+Roth intersectionCSG(Roth roth1, Roth roth2, vec3 ray_dir) {
+    Roth result;
+    result.nb_hits = 0;
+
+    int i = 0, j = 0;
+
+    // Merge hits from both roths, keeping them ordered by distance
+    int inside_count = 0;
+    while (i < roth1.nb_hits && j < roth2.nb_hits && result.nb_hits < 8) {
+        if (roth1.hits[i].distance < roth2.hits[j].distance) {
+            if (i % 2 != 0) {
+                if (inside_count == 2) {
+                    result.hits[result.nb_hits] = roth1.hits[i];
+                    result.nb_hits++;
+                }
+                inside_count--;
+            }
+            else {
+                if (inside_count == 1) {
+                    result.hits[result.nb_hits] = roth1.hits[i];
+                    result.nb_hits++;
+                }
+                inside_count++;
+            }
+            i++;
+        } else {
+            if (j % 2 != 0) {
+                if (inside_count == 2) {
+                    result.hits[result.nb_hits] = roth2.hits[j];
+                    result.nb_hits++;
+                }
+                inside_count--;
+            }
+            else {
+                if (inside_count == 1) {
+                    result.hits[result.nb_hits] = roth2.hits[j];
+                    result.nb_hits++;
+                }
+                inside_count++;
+            }
+            j++;
+        }
+    }
+
+    return result;
+}
+
+// Complement operation: Inverts an object, turning inside to outside
+Roth complementCSG(Roth roth) {
+    Roth result;
+
+    // For empty Roth, complement is a special case
+    if (roth.nb_hits == 0) {
+        // Create a "universe" hit at infinity
+        result.nb_hits = 2;
+        result.hits[0].distance = 0.0;
+        result.hits[0].surface_normal = vec3(0.0, 0.0, 0.0);
+        result.hits[0].surface_material_index = 0;
+
+        result.hits[1].distance = 1.0e30;// Very far away
+        result.hits[1].surface_normal = vec3(0.0, 0.0, 0.0);
+        result.hits[1].surface_material_index = 0;
+        return result;
+    }
+
+    result.nb_hits = roth.nb_hits;
+
+    // Swap entry and exit points by reversing the array
+    for (int i = 0; i < roth.nb_hits; i++) {
+        result.hits[i] = roth.hits[roth.nb_hits - 1 - i];
+    }
+
+    return result;
+}
+
+// Difference operation: Subtracts the second object from the first
+Roth differenceCSG(Roth roth1, Roth roth2, vec3 ray_dir) {
+    Roth complement = complementCSG(roth2);
+    return intersectionCSG(roth1, complement, ray_dir);
+}
+
+// Main CSG ray function that performs (Sphere1 ∩ Sphere2) + Sphere3) – Sphere4
+float rayCSG(vec3 ray_pos, vec3 ray_dir, out vec3 intersect_point, out vec3 normal, out int object_id, out int object_type) {
+    // Get sphere data from uniform array
+    vec3 sphere1_pos = objects.csgSpheres[0].xyz;
+    float sphere1_radius = objects.csgSpheres[0].w;
+
+    vec3 sphere2_pos = objects.csgSpheres[1].xyz;
+    float sphere2_radius = objects.csgSpheres[1].w;
+
+    vec3 sphere3_pos = objects.csgSpheres[2].xyz;
+    float sphere3_radius = objects.csgSpheres[2].w;
+
+    vec3 sphere4_pos = objects.csgSpheres[3].xyz;
+    float sphere4_radius = objects.csgSpheres[3].w;
+
+    // Calculate CSG operations step by step
+    // 1. Get intersections with each sphere
+    Roth roth1 = ray_sphere_roth(ray_pos, ray_dir, sphere1_pos, sphere1_radius, 0);
+    Roth roth2 = ray_sphere_roth(ray_pos, ray_dir, sphere2_pos, sphere2_radius, 1);
+    Roth roth3 = ray_sphere_roth(ray_pos, ray_dir, sphere3_pos, sphere3_radius, 2);
+    Roth roth4 = ray_sphere_roth(ray_pos, ray_dir, sphere4_pos, sphere4_radius, 3);
+
+    // 2. Perform (Sphere1 ∩ Sphere2) + Sphere3) – Sphere4
+    Roth intersection_result = intersectionCSG(roth1, roth2, ray_dir);// Sphere1 ∩ Sphere2
+    Roth union_result = unionCSG(intersection_result, roth3);// (Sphere1 ∩ Sphere2) + Sphere3
+    Roth final_result = differenceCSG(union_result, roth4, ray_dir);// ((Sphere1 ∩ Sphere2) + Sphere3) - Sphere4
+
+    // 3. Find closest hit point in the final result
+    if (final_result.nb_hits > 0) {
+        intersect_point = ray_pos + final_result.hits[0].distance * ray_dir;
+        normal = final_result.hits[0].surface_normal;
+        object_id = final_result.hits[0].surface_material_index;
+        object_type = 3;// Special type for CSG objects
+        return final_result.hits[0].distance;
+    }
+
+    return -1.0;// No intersection
+}
+
+// Find the nearest intersection
+float compute_nearest_intersection(vec3 ray_pos, vec3 ray_dir, float time, out vec3 intersec_i, out vec3 normal_i, out int object_id, out int object_type) {
+    float dist = 1e10f;
+    bool hit = false;
+
+    // Test spheres
+    for (int i = 0; i < objects.numSpheres && i < 256; i++) {
+        vec3 intersec_point_sphere;
+        vec3 normal_sphere;
+        float sphere_dist = ray_sphere(ray_pos, ray_dir, i, time, intersec_point_sphere, normal_sphere);
+        if (sphere_dist > 0.0 && sphere_dist < dist) {
+            intersec_i = intersec_point_sphere;
+            normal_i = normal_sphere;
+            dist = sphere_dist;
+            object_id = i;
+            object_type = 0;
+            hit = true;
+        }
+    }
+
+    // Test planes
+    for (int i = 0; i < objects.numPlanes && i < 128; i++) {
+        vec3 plane_pos = objects.planes[i * 2];
+        vec3 plane_normal = objects.planes[i * 2 + 1];
+        vec3 intersec_point_plane;
+        vec3 normal_plane;
+        float plane_dist = ray_plane(ray_pos, ray_dir, plane_pos, plane_normal, intersec_point_plane, normal_plane);
+        if (plane_dist > 0.0 && plane_dist < dist) {
+            intersec_i = intersec_point_plane;
+            normal_i = normal_plane;
+            dist = plane_dist;
+            object_id = i;
+            object_type = 1;
+            hit = true;
+        }
+    }
+
+    // Test triangles
+    for (int i = 0; i < objects.numTriangles && i < 85; i++) {
+        vec3 p0 = objects.triangles[i * 3];
+        vec3 p1 = objects.triangles[i * 3 + 1];
+        vec3 p2 = objects.triangles[i * 3 + 2];
+        vec3 intersec_point_triangle;
+        vec3 normal_triangle;
+        float triangle_dist = ray_triangle(ray_pos, ray_dir, p0, p1, p2, intersec_point_triangle, normal_triangle);
+        if (triangle_dist > 0.0 && triangle_dist < dist) {
+            intersec_i = intersec_point_triangle;
+            normal_i = normal_triangle;
+            dist = triangle_dist;
+            object_id = i;
+            object_type = 2;
+            hit = true;
+        }
+    }
+
+    // Would add CSG intersection here, simplifying for clarity
+
+    if (!hit) return -1.0;
+    return dist;
+}
+
+// Get material for a hit point
+Material get_material(int object_type, int object_id, vec3 position) {
+    Material mat;
+    mat.reflection_coef = 0.0f;
+    mat.refraction_coef = 0.0f;
+    mat.refraction_index = 1.0f;
+    mat.absorption = vec3(0.0);
+
+    if (object_type == 0) { // Sphere
+        return objects.sphere_materials[object_id];
+    }
+    else if (object_type == 1) { // Plane
+        // Create checkerboard pattern based on the position
+        vec3 plane_pos = objects.planes[object_id * 2];
+        vec3 plane_normal = normalize(objects.planes[object_id * 2 + 1]);
+
+        vec3 u_axis = normalize(cross(plane_normal, abs(plane_normal.y) < 0.999 ? vec3(0, 1, 0) : vec3(1, 0, 0)));
+        vec3 v_axis = normalize(cross(plane_normal, u_axis));
+
+        float u = dot(position - plane_pos, u_axis);
+        float v = dot(position - plane_pos, v_axis);
+
+        float scale = 1.0;
+        bool isEvenU = mod(floor(u * scale), 2.0) < 1.0;
+        bool isEvenV = mod(floor(v * scale), 2.0) < 1.0;
+        bool isBlack = isEvenU != isEvenV;
+
+        mat.ambient = vec3(0.1, 0.1, 0.1);
+        mat.specular = vec3(0.2, 0.2, 0.2);
+        mat.shininess = 4.0;
+
+        if (isBlack) {
+            mat.diffuse = vec3(0.1, 0.1, 0.1);
+        } else {
+            mat.diffuse = vec3(0.9, 0.9, 0.9);
+        }
+    }
+    else if (object_type == 2) { // Triangle/Mesh
+        return objects.triangle_materials[object_id];
+    }
+    else {
+        return objects.csg_sphere_materials[object_id];
+    }
+
+    return mat;
+}
+
+// Calculate lighting
+vec3 calculate_lighting(vec3 position, vec3 normal, vec3 view_dir, Material material, vec3 light_color) {
+    // Ambient
+    vec3 ambient = material.ambient * lighting.ambientLight;
+
+    vec3 light_pos = lighting.lightPosition.xyz;
+    float light_intensity = lighting.lightPosition.w;
+
+    vec3 light_dir = normalize(light_pos - position);
+    float light_distance = distance(light_pos, position);
+
+    // Diffuse
+    float diff = max(dot(normal, light_dir), 0.0);
+    vec3 diffuse = diff * material.diffuse * vec3(1.0);
+
+    // Specular
+    vec3 specular;
+    if (lighting.lightType == 0) {
+        // Phong
+        vec3 reflect_dir = reflect(-light_dir, normal);
+        float spec = pow(max(dot(view_dir, reflect_dir), 0.0), material.shininess);
+        specular = spec * material.specular;
+    } else {
+        // Blinn-Phong
+        vec3 halfway = normalize(light_dir + view_dir);
+        float spec = pow(max(dot(halfway, normal), 0.0), material.shininess);
+        specular = spec * material.specular;
+    }
+
+    // Attenuation
+    float attenuation = 1.0 / (1.0 + 0.09 * light_distance + 0.032 * light_distance * light_distance);
+
+    // Shadow calculation would go here (simplified for now)
+    float shadow = 1.0;
+
+    vec3 result = ambient + shadow * (diffuse + specular * light_intensity);
+    result *= light_color;
+    return result;
+}
+
+// Calculate primary ray direction for a pixel
+void compute_primary_ray(vec2 uv, out vec3 ray_pos, out vec3 ray_dir) {
+    vec3 from = camera.cameraPosition;
+    vec3 to = camera.cameraTarget;
+    float fovy = camera.cameraFov;
+
+    float aspect = camera.windowSize.x / camera.windowSize.y;
+    vec2 uv_size;
+    if (aspect >= 1.0) {
+        uv_size = vec2(2.0 * aspect, 2.0);
+    } else {
+        uv_size = vec2(2.0, 2.0 / aspect);
+    }
+
+    vec3 forward = normalize(from - to);
+    vec3 right = normalize(cross(vec3(0.0f, 1.0f, 0.0f), forward));
+    vec3 up = cross(forward, right);
+
+    float dist = uv_size.y / tan(fovy / 2);
+    vec3 direction = normalize(uv.x * right + uv.y * up - dist * forward);
+
+    // Handle depth of field
+    if (camera.apertureSize < 0.001) {
+        ray_pos = from;
+        ray_dir = direction;
+        return;
+    }
+
+    vec3 focal_point = from + direction * camera.focalDistance;
+    vec2 lens_offset = random_disk() * camera.apertureSize;
+    vec3 lens_pos = from + lens_offset.x * right + lens_offset.y * up;
+
+    ray_pos = lens_pos;
+    ray_dir = normalize(focal_point - lens_pos);
+}
+
+// Create a glossy reflection direction with randomness
+vec3 glossy_reflect(vec3 incident, vec3 normal, float glossiness) {
+    vec3 reflection = reflect(incident, normal);
+
+    if (glossiness < 0.001f) {
+        return reflection;
+    }
+
+    vec3 random_dir = random_hemisphere_direction(normal);
+    return normalize(mix(reflection, random_dir, glossiness));
+}
+
+// Ray queue for parallel processing
+struct RayQueue {
+    Ray rays[512];// Increased queue size
+    int count;
+};
+
+// Process ray batches in parallel
+vec3 trace_ray_batch(vec2 pixel_coord) {
+    // Initialize the seed for random number generation
+    seed = int(pixel_coord.x) + int(camera.windowSize.x) * int(pixel_coord.y);
+
+    vec3 final_color = vec3(0.0);
+    int samples = max(1, lighting.sampleRate);
+    float step_size = 1.0 / samples;
+
+    for (int s = 0; s < samples*samples; s++) {
+        int x = s % samples;
+        int y = s / samples;
+
+        vec2 offset = vec2(
+        (float(x) + 0.5) * step_size - 0.5,
+        (float(y) + 0.5) * step_size - 0.5
+        ) / camera.windowSize;
+
+        vec2 sample_coord = pixel_coord + offset * camera.windowSize;
+        vec2 sample_uv = (sample_coord / camera.windowSize - 0.5) * 2.0;
+
+        float aspect = camera.windowSize.x / camera.windowSize.y;
+        if (aspect >= 1.0) {
+            sample_uv.x *= aspect;
+        } else {
+            sample_uv.y /= aspect;
+        }
+
+        // Initialize ray queue
+        RayQueue primary_rays;
+        primary_rays.count = 1;
+
+        // Set up primary ray
+        compute_primary_ray(sample_uv, primary_rays.rays[0].origin, primary_rays.rays[0].direction);
+        primary_rays.rays[0].mask = vec3(1.0);
+        primary_rays.rays[0].current_ior = 1.0;
+        primary_rays.rays[0].depth = 0;
+        primary_rays.rays[0].is_active = true;
+
+        // Trace primary rays
+        vec3 sample_color = vec3(0.0);
+
+        // Process all rays in the queue
+        for (int depth = 0; depth <= lighting.recursionDepth; depth++) {
+            // Secondary rays queue
+            RayQueue secondary_rays;
+            secondary_rays.count = 0;
+
+            // Process each ray in the current batch
+            for (int r = 0; r < primary_rays.count; r++) {
+                Ray ray = primary_rays.rays[r];
+
+                if (!ray.is_active) continue;
+
+                // Find intersection
+                vec3 intersect_point;
+                vec3 normal;
+                int object_id, object_type;
+
+                float dist = compute_nearest_intersection(
+                ray.origin, ray.direction, 0.0,
+                intersect_point, normal, object_id, object_type
+                );
+
+                if (dist > 0.0) {
+                    // Hit something
+                    Material material = get_material(object_type, object_id, intersect_point);
+                    vec3 view_dir = normalize(ray.origin - intersect_point);
+
+                    // Direct lighting
+                    vec3 direct_light = calculate_lighting(
+                    intersect_point, normal, view_dir, material, lighting.lightColor
+                    );
+
+                    // Add direct lighting contribution
+                    sample_color += ray.mask * direct_light;
+
+                    // Handle reflection and refraction
+                    float refraction_coef = material.refraction_coef;
+                    float reflection_coef = material.reflection_coef;
+                    bool has_reflection = reflection_coef > 0.0;
+                    bool has_refraction = refraction_coef > 0.0;
+
+                    // Refraction
+                    if (has_refraction && depth < lighting.recursionDepth && secondary_rays.count < 512) {
+                        // Compute refraction
+                        bool is_entering = dot(ray.direction, normal) > 0.0;
+                        vec3 new_normal = normal;
+                        if (is_entering) new_normal = -new_normal;
+                        float eta_from = ray.current_ior;
+                        float eta_to = material.refraction_index;
+                        float eta = eta_from / eta_to;
+
+                        // Calculate fresnel
+                        float fresnel = 0.0;
+                        if (lighting.use_fresnel) {
+                            float cos_theta = abs(dot(ray.direction, new_normal));
+                            float r0 = pow((eta_from - eta_to) / (eta_from + eta_to), 2);
+                            fresnel = r0 + (1.0 - r0) * pow(1.0 - cos_theta, 5.0);
+                        }
+
+                        // Adjust coefficients
+                        float prev_refraction_coef = refraction_coef;
+                        refraction_coef = refraction_coef - prev_refraction_coef * fresnel;
+                        reflection_coef = reflection_coef + prev_refraction_coef * fresnel;
+
+                        has_reflection = reflection_coef > 0.0f;
+
+                        // Create refraction ray
+                        vec3 refracted = refract(ray.direction, new_normal, eta);
+
+                        if (length(refracted) > 0.0) { // Valid refraction
+                            Ray refract_ray;
+                            refract_ray.direction = refracted;
+                            refract_ray.origin = intersect_point - new_normal * 1e-3;
+                            refract_ray.mask = ray.mask * refraction_coef;
+
+                            // Handle absorption for inside rays
+                            if (!is_entering) {
+                                vec3 absorption = exp(-material.absorption * dist);
+                                refract_ray.mask *= absorption;
+                            }
+
+                            refract_ray.current_ior = eta_to;
+                            refract_ray.depth = depth + 1;
+                            refract_ray.is_active = true;
+
+                            secondary_rays.rays[secondary_rays.count] = refract_ray;
+                            secondary_rays.count++;
+                        }
+                    }
+
+                    // Reflection
+                    if (has_reflection && depth < lighting.recursionDepth && secondary_rays.count < 512) {
+                        Ray reflect_ray;
+                        reflect_ray.direction = glossy_reflect(ray.direction, normal, material.glossiness);
+                        reflect_ray.origin = intersect_point + normal * 1e-3;
+                        reflect_ray.mask = ray.mask * reflection_coef;
+                        reflect_ray.current_ior = ray.current_ior;
+                        reflect_ray.depth = depth + 1;
+                        reflect_ray.is_active = true;
+
+                        secondary_rays.rays[secondary_rays.count] = reflect_ray;
+                        secondary_rays.count++;
+                    }
+                } else {
+                    // Ray hit nothing, add background color
+                    sample_color += ray.mask * vec3(0.2f, 0.3f, 0.4f);
+                }
+            }
+
+            // If no secondary rays, we're done
+            if (secondary_rays.count == 0) break;
+
+            // Replace primary ray queue with secondary rays
+            primary_rays.count = secondary_rays.count;
+            for (int i = 0; i < secondary_rays.count; i++) {
+                primary_rays.rays[i] = secondary_rays.rays[i];
+            }
+        }
+
+        // Accumulate sample color
+        final_color += sample_color;
+    }
+
+    // Average samples
+    return final_color / float(samples * samples);
+}
+
+// Main compute shader function
+void main() {
+    // Get current pixel
+    ivec2 pixel_coord = ivec2(gl_GlobalInvocationID.xy);
+
+    // Check if within image bounds
+    if (pixel_coord.x >= int(camera.windowSize.x) || pixel_coord.y >= int(camera.windowSize.y)) {
+        return;
+    }
+
+    // Trace rays for this pixel
+    vec3 pixel_color = trace_ray_batch(vec2(pixel_coord));
+
+    // Store result in output image
+    imageStore(outputImage, pixel_coord, vec4(pixel_color, 1.0));
+}

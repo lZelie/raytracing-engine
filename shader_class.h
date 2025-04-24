@@ -14,15 +14,18 @@ namespace gl3
     public:
         GLuint id;
 
-        shader_class(const char* vertexFile, const char* fragmentFile);
+        // Constructor for graphics shaders (vertex + fragment)
+        shader_class(const char* vertex_file, const char* fragment_file);
+
+        // Constructor for compute shaders
+        explicit shader_class(const char* compute_file);
 
         void activate() const;
         static void deactivate();
 
         ~shader_class();
 
-    public:
-        static void compileErrors(unsigned int shader, const char* type);
+        static void compile_errors(unsigned int shader, const char* type);
     };
 }
 

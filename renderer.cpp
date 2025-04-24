@@ -19,7 +19,7 @@ void gl3::renderer::init_window()
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 
-    // Create window
+    // Create the window
     window = glfwCreateWindow(INITIAL_WIDTH, INITIAL_HEIGHT, WINDOW_TITLE, nullptr, nullptr);
     glfwMakeContextCurrent(window);
 
@@ -60,6 +60,7 @@ void gl3::renderer::setup_callbacks()
     {
         const auto renderer = static_cast<gl3::renderer*>(glfwGetWindowUserPointer(win));
         renderer->scene_data.get_camera().window_size = {width, height};
+        if (renderer->compute_rend){renderer->compute_rend->resize(width, height);}
     });
 
     // Keyboard input callback
@@ -84,6 +85,12 @@ void gl3::renderer::setup_callbacks()
             renderer->scene_data.get_lighting().light_type =
                 renderer->scene_data.get_lighting().light_type == 0 ? 1 : 0;
         }
+        if (key == GLFW_KEY_R && action == GLFW_PRESS)
+        {
+            // Toggle between compute and fragment shader
+            renderer->use_compute_shader = !renderer->use_compute_shader;
+            std::cout << "Using " << (renderer->use_compute_shader ? "compute" : "fragment") << " shader" << std::endl;
+        }
         if (key == GLFW_KEY_KP_ADD && action == GLFW_PRESS)
         {
             renderer->scene_data.get_lighting().recursion_depth++;
@@ -96,6 +103,14 @@ void gl3::renderer::setup_callbacks()
         if (key == GLFW_KEY_U && action == GLFW_PRESS)
         {
             renderer->shader_program = std::make_unique<shader_class>("shaders/default.vert", "shaders/default.frag");
+            if (renderer->compute_rend)
+            {
+                int width;
+                int height;
+                glfwGetFramebufferSize(win, &width, &height);
+                renderer->compute_rend.reset();
+                renderer->compute_rend = std::make_unique<compute_renderer>(renderer->scene_data, width, height);
+            }
         }
     });
 
@@ -129,6 +144,19 @@ void gl3::renderer::render_ui()
 
     // FPS display
     ImGui::Text("FPS: %.1f", current_FPS);
+    ImGui::Separator();
+
+    // Render method selection
+    if (ImGui::Checkbox("Use Compute Shader", &use_compute_shader) && use_compute_shader && !compute_rend)
+    {
+        // If we're toggling to the compute shader, and it doesn't exist, create it
+        int width;
+        int height;
+        glfwGetWindowSize(window, &width, &height);
+        compute_rend = std::make_unique<compute_renderer>(scene_data, width, height);
+    }
+    ImGui::SameLine();
+    ImGui::Text("Press R to toggle between compute and fragment shader");
     ImGui::Separator();
 
     // Tab selection
@@ -618,24 +646,19 @@ void gl3::renderer::render_ui()
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 }
 
-gl3::renderer::renderer() :
-    window(nullptr),
-    cameraFov(CAMERA_FOV),
-    camera(INITIAL_WIDTH, INITIAL_HEIGHT, {0.0f, 1.0f, 1.0f}),
-    show_ui(true),
-    camera_mode(false)
+gl3::renderer::renderer()
 {
     init_window();
 
     // Initialize scene data
     scene_data.initialize();
 
-    // Set up camera initial position from scene data
+    // Set up the camera to its initial position from scene data
     const auto& camera_data = scene_data.get_camera();
     camera.position = camera_data.position;
     camera.orientation = glm::normalize(camera_data.target - camera_data.position);
 
-    // Create shader program
+    // Create the shader program
     shader_program = std::make_unique<gl3::shader_class>("shaders/default.vert", "shaders/default.frag");
 
     // Create quad for rendering
@@ -645,12 +668,15 @@ gl3::renderer::renderer() :
     // Initialize ImGui
     init_imgui();
 
-    // Set default clear color
+    // Set the default clear color
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 }
 
 gl3::renderer::~renderer()
 {
+    // Clean up the compute renderer
+    compute_rend.reset();
+    
     // Shutdown ImGui
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
@@ -662,12 +688,16 @@ gl3::renderer::~renderer()
 
 void gl3::renderer::render_frame()
 {
-    // Update viewport and clear buffers
-    glViewport(0, 0, static_cast<int>(scene_data.get_camera().window_size.x),
-               static_cast<int>(scene_data.get_camera().window_size.y));
+    // Update viewport
+    int width;
+    int height;
+    glfwGetFramebufferSize(window, &width, &height);
+    glViewport(0, 0, width, height);
+
+    // Clear buffers
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-    // If in camera mode, update scene camera from the interactive camera
+    // If in camera mode, update the scene camera from the interactive camera
     if (camera_mode)
     {
         camera.inputs(window);
@@ -675,13 +705,26 @@ void gl3::renderer::render_frame()
         scene_data.get_camera().target = camera.position + camera.orientation;
     }
 
-    // Update UBOs with current scene data
-    scene_data.update_UBOs();
+    if (use_compute_shader)
+    {
+        // Initialize the compute renderer if it doesn't exist
+        if (!compute_rend)
+        {
+            compute_rend = std::make_unique<compute_renderer>(scene_data, width, height);
+        }
 
-    // Activate shader and draw quad
-    shader_program->activate();
-    quad_VAO->bind();
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        // Render using the compute shader
+        compute_rend->render();
+        compute_rend->display();
+    } else {
+        // Update UBOs with current scene data
+        scene_data.update_UBOs();
+
+        // Activate shader and draw quad
+        shader_program->activate();
+        quad_VAO->bind();
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
 
     // Render ImGui UI if enabled
     if (show_ui)

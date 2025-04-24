@@ -85,6 +85,8 @@ add_executable(Raytracing1 main.cpp
         Renderer.h
         scene_data.cpp
         scene_data.h
+        compute_renderer.cpp
+        compute_renderer.h
 )
 target_include_directories(Raytracing1 PRIVATE "${CMAKE_SOURCE_DIR}/include" external/glew/include)
 target_link_libraries(Raytracing1 ${OPENGL_LIBRARY} glfw glm::glm-header-only GLEW::GLEW_S imgui)
