@@ -5,6 +5,9 @@
 #include "glm/vec3.hpp"
 #include "glm/vec4.hpp"
 
+// Maximum number of bvh nodes
+constexpr int MAX_BVH_NODES = 1024;
+
 // Maximum number of objects in the scene
 constexpr int MAX_SPHERES = 256;
 constexpr int MAX_PLANES = 128;
@@ -16,6 +19,7 @@ constexpr int MAX_MATERIALS = MAX_SPHERES + MAX_PLANES + MAX_TRIANGLES + MAX_CSG
 constexpr int CAMERA_UBO_BINDING = 0;
 constexpr int OBJECTS_UBO_BINDING = 1;
 constexpr int LIGHTING_UBO_BINDING = 2;
+constexpr int BVH_UBO_BINDING = 3;
 
 // SceneData class to manage all scene objects and UBOs
 class scene_data
@@ -158,6 +162,44 @@ public:
         int shadow_samples = 1;
     };
 
+    // Node structure for the bvh
+    struct bvh_node
+    {
+        glm::vec3 aabb_min = glm::vec3(0.0f); // Bounding box minimum point
+        int left_child = -1; // Left child node index (-1 is leaf)
+        glm::vec3 aabb_max = glm::vec3(0.0f); // Bounding box maximum point 
+        int right_child = -1; // Right child node index (-1 is leaf)
+
+        // For leaf nodes only
+        int object_index = -1; // First object index in this leaf
+        int object_count = 0; // Number of objects in this leaf
+        int object_type = -1; // Object type (0 = sphere, 1 = plane, 2 = triangle, 3=CSG)
+        float padding = 0.0f; // Padding for alignment
+
+        // Constructor for internal nodes
+        bvh_node(const glm::vec3& min, const glm::vec3& max, const int left, const int right) : aabb_min(min),
+            left_child(left), aabb_max(max), right_child(right)
+        {
+        }
+
+        // Constructor for leaf nodes
+        bvh_node(const glm::vec3& min, const glm::vec3& max, const int index, const int count, const int type) :
+            aabb_min(min), aabb_max(max), object_index(index), object_count(count), object_type(type)
+        {
+        }
+
+        // Default constructor
+        bvh_node() = default;
+    };
+    
+    struct bvh_data
+    {
+        std::array<bvh_node, MAX_BVH_NODES> nodes;
+        int num_nodes = 0;
+        int root_node = 0;
+        std::array<float, 2> padding{};
+    };
+
     scene_data();
     ~scene_data();
 
@@ -171,9 +213,13 @@ public:
     camera_data& get_camera() { return camera; }
     scene_objects& get_objects() { return objects; }
     lighting_data& get_lighting() { return lighting; }
+    bvh_data& get_bvh() { return bvh; }
 
-    // Reset to default scene
+    // Reset to the default scene
     void reset_to_default();
+
+    // Build BVH from the current scene
+    void build_bvh();
 
     // Add/modify objects
     void add_sphere(const glm::vec3& position, float radius);
@@ -185,11 +231,13 @@ private:
     camera_data camera{};
     scene_objects objects{};
     lighting_data lighting{};
+    bvh_data bvh{};
 
     // UBO handles
     GLuint camera_UBO;
     GLuint objects_UBO;
     GLuint lighting_UBO;
+    GLuint bvh_UBO;
 
     // Create the uniform buffer objects
     void create_UBOs();

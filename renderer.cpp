@@ -266,6 +266,19 @@ void gl3::renderer::render_ui()
                 ImGui::PopID();
             }
 
+            // BVH Settings
+            ImGui::Separator();
+            ImGui::Text("BVH Settings");
+            ImGui::Text("BVH nodes: %d", scene_data.get_bvh().num_nodes);
+
+            // Button to rebuild BVH
+            if (ImGui::Button("Rebuild BVH"))
+            {
+                scene_data.build_bvh();
+            }
+            ImGui::SameLine();
+            ImGui::Text("Use this to rebuild the BVH when you add or remove objects");
+
             ImGui::EndTabItem();
         }
 

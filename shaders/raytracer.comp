@@ -61,6 +61,25 @@ layout (std140, binding = 2) uniform LightingBlock {
     int shadow_samples;
 } lighting;
 
+// BVH UBO
+struct BVHNode {
+    vec3 aabb_min;
+    int left_child;
+    vec3 aabb_max;
+    int right_child;
+    int object_index;
+    int object_count;
+    int object_type;
+    float padding;
+};
+
+layout (std140, binding = 3) uniform BVHBlock {
+    BVHNode nodes[1024];
+    int numNodes;
+    int rootNode;
+    vec2 padding;
+} bvh;
+
 layout(rgba32f, binding = 0) uniform image2D outputImage;
 
 // Ray and Hit structures
@@ -83,6 +102,32 @@ struct Roth {
     int nb_hits;
     Hit hits[8];
 };
+
+// Stack structure for BVH traversal (non-recursive)
+const int MAX_STACK_SIZE = 64;
+struct BVHTraversalStack {
+    int stack[MAX_STACK_SIZE];
+    int size;
+};
+
+void stackPush(inout BVHTraversalStack stack, int node) {
+    if (stack.size < MAX_STACK_SIZE) {
+        stack.stack[stack.size] = node;
+        stack.size++;
+    }
+}
+
+int stackPop(inout BVHTraversalStack stack) {
+    if (stack.size > 0) {
+        stack.size--;
+        return stack.stack[stack.size];
+    }
+    return -1;
+}
+
+bool stackIsEmpty(BVHTraversalStack stack) {
+    return stack.size == 0;
+}
 
 // Random number generation
 int seed = 0;
@@ -118,6 +163,21 @@ vec2 random_disk() {
     float r = sqrt(random());
     float theta = 2.0 * 3.14159265359 * random();
     return vec2(r * cos(theta), r * sin(theta));
+}
+
+// Test if a ray intersects an AABB
+bool ray_aabb_intersection(vec3 ray_origin, vec3 ray_dir, vec3 box_min, vec3 box_max) {
+    vec3 inv_dir = 1.0 / ray_dir;
+    vec3 t_min = (box_min - ray_origin) * inv_dir;
+    vec3 t_max = (box_max - ray_origin) * inv_dir;
+
+    vec3 t1 = min(t_min, t_max);
+    vec3 t2 = max(t_min, t_max);
+
+    float t_near = max(max(t1.x, t1.y), t1.z);
+    float t_far = min(min(t2.x, t2.y), t2.z);
+
+    return t_near <= t_far && t_far > 0.0;
 }
 
 // Ray-Sphere intersection
@@ -199,6 +259,7 @@ float ray_plane(vec3 ray_pos, vec3 ray_dir, vec3 plane_pos, vec3 plane_normal, o
     return t;
 }
 
+// Ray-CSG operations
 Roth ray_sphere_roth(vec3 ray_pos, vec3 ray_dir, vec3 sphere_pos, float sphere_radius, int material_index) {
     Roth result;
     result.nb_hits = 0;
@@ -423,65 +484,115 @@ float rayCSG(vec3 ray_pos, vec3 ray_dir, out vec3 intersect_point, out vec3 norm
     return -1.0;// No intersection
 }
 
-// Find the nearest intersection
+// Test intersection between a ray and a single object (used within BVH traversal)
+float intersect_object(vec3 ray_pos, vec3 ray_dir, int object_index, int object_type, float time,
+out vec3 intersect_point, out vec3 normal) {
+    if (object_type == 0) { // Sphere
+        return ray_sphere(ray_pos, ray_dir, object_index, time, intersect_point, normal);
+    }
+    else if (object_type == 1) { // Plane
+        vec3 plane_pos = objects.planes[object_index * 2];
+        vec3 plane_normal = objects.planes[object_index * 2 + 1];
+        return ray_plane(ray_pos, ray_dir, plane_pos, plane_normal, intersect_point, normal);
+    }
+    else if (object_type == 2) { // Triangle
+        vec3 p0 = objects.triangles[object_index * 3];
+        vec3 p1 = objects.triangles[object_index * 3 + 1];
+        vec3 p2 = objects.triangles[object_index * 3 + 2];
+        return ray_triangle(ray_pos, ray_dir, p0, p1, p2, intersect_point, normal);
+    }
+
+    return -1.0; // Invalid object type
+}
+
+// Find the nearest intersection using BVH traversal
 float compute_nearest_intersection(vec3 ray_pos, vec3 ray_dir, float time, out vec3 intersec_i, out vec3 normal_i, out int object_id, out int object_type) {
-    float dist = 1e10f;
-    bool hit = false;
+    // Default to no intersection
+    float closest_dist = 1e30;
+    bool hit_found = false;
 
-    // Test spheres
-    for (int i = 0; i < objects.numSpheres && i < 256; i++) {
-        vec3 intersec_point_sphere;
-        vec3 normal_sphere;
-        float sphere_dist = ray_sphere(ray_pos, ray_dir, i, time, intersec_point_sphere, normal_sphere);
-        if (sphere_dist > 0.0 && sphere_dist < dist) {
-            intersec_i = intersec_point_sphere;
-            normal_i = normal_sphere;
-            dist = sphere_dist;
-            object_id = i;
-            object_type = 0;
-            hit = true;
+    // Initialize BVH traversal stack
+    BVHTraversalStack stack;
+    stack.size = 0;
+
+    // Start with the root node
+    int current_node = bvh.rootNode;
+
+    // Non-recursive traversal
+    while (current_node >= 0 || !stackIsEmpty(stack)) {
+        // If current_node is invalid, pop the next one from the stack
+        if (current_node < 0) {
+            current_node = stackPop(stack);
+            continue;
+        }
+
+        BVHNode node = bvh.nodes[current_node];
+
+        // Test if this node's bounding box intersects with the ray
+        if (!ray_aabb_intersection(ray_pos, ray_dir, node.aabb_min, node.aabb_max)) {
+            // No intersection with this node's AABB, skip this subtree
+            current_node = stackPop(stack);
+            continue;
+        }
+
+        // If this is a leaf node, test all objects in this node
+        if (node.left_child < 0) { // Leaf node
+            for (int i = 0; i < node.object_count; i++) {
+                int obj_idx = node.object_index + i;
+                vec3 intersect_point;
+                vec3 normal;
+
+                float dist = intersect_object(ray_pos, ray_dir, obj_idx, node.object_type, time, intersect_point, normal);
+
+                if (dist > 0.0 && dist < closest_dist) {
+                    closest_dist = dist;
+                    intersec_i = intersect_point;
+                    normal_i = normal;
+                    object_id = obj_idx;
+                    object_type = node.object_type;
+                    hit_found = true;
+                }
+            }
+
+            // Done with this leaf node, pop next node from stack
+            current_node = stackPop(stack);
+        }
+        else {
+            // Internal node - push children to stack
+            // Push the further child first (to be processed later)
+            // Process the closer child immediately
+
+            // Determine which child is closer to the ray origin
+            float mid_x = (node.aabb_min.x + node.aabb_max.x) * 0.5;
+            bool left_first = ray_pos.x < mid_x || (ray_pos.x == mid_x && ray_dir.x < 0.0);
+
+            if (left_first) {
+                stackPush(stack, node.right_child);
+                current_node = node.left_child;
+            } else {
+                stackPush(stack, node.left_child);
+                current_node = node.right_child;
+            }
         }
     }
 
-    // Test planes
-    for (int i = 0; i < objects.numPlanes && i < 128; i++) {
-        vec3 plane_pos = objects.planes[i * 2];
-        vec3 plane_normal = objects.planes[i * 2 + 1];
-        vec3 intersec_point_plane;
-        vec3 normal_plane;
-        float plane_dist = ray_plane(ray_pos, ray_dir, plane_pos, plane_normal, intersec_point_plane, normal_plane);
-        if (plane_dist > 0.0 && plane_dist < dist) {
-            intersec_i = intersec_point_plane;
-            normal_i = normal_plane;
-            dist = plane_dist;
-            object_id = i;
-            object_type = 1;
-            hit = true;
-        }
+    // Check for CSG objects - not yet integrated into BVH
+    vec3 csg_intersect_point;
+    vec3 csg_normal;
+    int csg_object_id, csg_object_type;
+    float csg_dist = rayCSG(ray_pos, ray_dir, csg_intersect_point, csg_normal, csg_object_id, csg_object_type);
+
+    if ((csg_dist > 0.0) && (!hit_found || csg_dist < closest_dist)) {
+        intersec_i = csg_intersect_point;
+        normal_i = csg_normal;
+        object_id = csg_object_id;
+        object_type = csg_object_type;
+        closest_dist = csg_dist;
+        hit_found = true;
     }
 
-    // Test triangles
-    for (int i = 0; i < objects.numTriangles && i < 85; i++) {
-        vec3 p0 = objects.triangles[i * 3];
-        vec3 p1 = objects.triangles[i * 3 + 1];
-        vec3 p2 = objects.triangles[i * 3 + 2];
-        vec3 intersec_point_triangle;
-        vec3 normal_triangle;
-        float triangle_dist = ray_triangle(ray_pos, ray_dir, p0, p1, p2, intersec_point_triangle, normal_triangle);
-        if (triangle_dist > 0.0 && triangle_dist < dist) {
-            intersec_i = intersec_point_triangle;
-            normal_i = normal_triangle;
-            dist = triangle_dist;
-            object_id = i;
-            object_type = 2;
-            hit = true;
-        }
-    }
-
-    // Would add CSG intersection here, simplifying for clarity
-
-    if (!hit) return -1.0;
-    return dist;
+    if (!hit_found) return -1.0;
+    return closest_dist;
 }
 
 // Get material for a hit point
@@ -563,8 +674,26 @@ vec3 calculate_lighting(vec3 position, vec3 normal, vec3 view_dir, Material mate
     // Attenuation
     float attenuation = 1.0 / (1.0 + 0.09 * light_distance + 0.032 * light_distance * light_distance);
 
-    // Shadow calculation would go here (simplified for now)
+    // Simplified shadow calculation (soft shadows would be calculated in a separate function)
     float shadow = 1.0;
+
+    // Basic shadow ray - using the BVH for shadow calculation too
+    if (lighting.shadow_samples > 0) {
+        // Offset position slightly to avoid self-intersection
+        vec3 offset_pos = position + normal * 0.001;
+        vec3 shadow_intersect_point, shadow_normal;
+        int shadow_obj_id, shadow_obj_type;
+
+        float shadow_dist = compute_nearest_intersection(
+        offset_pos, light_dir, 0.0,
+        shadow_intersect_point, shadow_normal,
+        shadow_obj_id, shadow_obj_type
+        );
+
+        if (shadow_dist > 0.0 && shadow_dist < light_distance) {
+            shadow = 0.0; // In shadow
+        }
+    }
 
     vec3 result = ambient + shadow * (diffuse + specular * light_intensity);
     result *= light_color;

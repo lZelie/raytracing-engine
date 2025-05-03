@@ -2,9 +2,10 @@
 
 #include <iostream>
 
+#include "bvh.h"
 #include "renderer.h"
 
-scene_data::scene_data() : camera_UBO(0), objects_UBO(0), lighting_UBO(0)
+scene_data::scene_data() : camera_UBO(0), objects_UBO(0), lighting_UBO(0), bvh_UBO(0)
 {
     // Initialize default camera settings
     camera.window_size = {INITIAL_WIDTH, INITIAL_HEIGHT};
@@ -24,6 +25,10 @@ scene_data::scene_data() : camera_UBO(0), objects_UBO(0), lighting_UBO(0)
     lighting.light_type = 0;
     lighting.sample_rate = 1;
     lighting.recursion_depth = 0;
+
+    // Initialize BVH
+    bvh.num_nodes = 0;
+    bvh.root_node = 0;
 }
 
 scene_data::~scene_data()
@@ -35,6 +40,8 @@ scene_data::~scene_data()
         glDeleteBuffers(1, &objects_UBO);
     if (lighting_UBO != 0)
         glDeleteBuffers(1, &lighting_UBO);
+    if (bvh_UBO != 0)
+        glDeleteBuffers(1, &bvh_UBO);
 }
 
 void scene_data::initialize()
@@ -71,6 +78,13 @@ void scene_data::create_UBOs()
     glBufferData(GL_UNIFORM_BUFFER, sizeof(lighting_data), nullptr, GL_DYNAMIC_DRAW);
     glBindBufferBase(GL_UNIFORM_BUFFER, LIGHTING_UBO_BINDING, lighting_UBO);
     glBindBuffer(GL_UNIFORM_BUFFER, 0);
+
+    // Create BVH UBO
+    glGenBuffers(1, &bvh_UBO);
+    glBindBuffer(GL_UNIFORM_BUFFER, bvh_UBO);
+    glBufferData(GL_UNIFORM_BUFFER, sizeof(bvh_data), nullptr, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_UNIFORM_BUFFER, BVH_UBO_BINDING, bvh_UBO);
+    glBindBuffer(GL_UNIFORM_BUFFER, 0);   
 }
 
 void scene_data::update_UBOs() const
@@ -89,6 +103,28 @@ void scene_data::update_UBOs() const
     glBindBuffer(GL_UNIFORM_BUFFER, lighting_UBO);
     glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(lighting_data), &lighting);
     glBindBuffer(GL_UNIFORM_BUFFER, 0);
+
+    // Update BVH UBO
+    glBindBuffer(GL_UNIFORM_BUFFER, bvh_UBO);
+    glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(bvh_data), &bvh);
+    glBindBuffer(GL_UNIFORM_BUFFER, 0);   
+}
+
+void scene_data::build_bvh()
+{
+    // Build the BVH using the bvh builder
+    std::vector<bvh_node> nodes = bvh_builder::build_bvh(objects.spheres, objects.num_spheres, objects.planes, objects.num_planes, objects.triangles, objects.num_triangles, objects.csg_spheres);
+
+    // Copy the nodes to the BVH data
+    bvh.num_nodes = std::min(static_cast<int>(nodes.size()), MAX_BVH_NODES);
+    bvh.root_node = 0;
+
+    for (int i = 0; i < bvh.num_nodes; i++)
+    {
+        bvh.nodes[i] = nodes[i];
+    }
+
+    std::cout << "BVH built with " << bvh.num_nodes << " nodes" << std::endl;
 }
 
 void scene_data::reset_to_default()
@@ -175,7 +211,9 @@ void scene_data::reset_to_default()
     objects.csg_sphere_materials[1] = {{0.8f, 0.2f, 0.2f}, {1.0f, 1.0f, 1.0f}, {0.1f, 0.1f, 0.1f}, 32.0f};
     objects.csg_sphere_materials[2] = {{0.2f, 0.2f, 0.8f}, {1.0f, 1.0f, 1.0f}, {0.1f, 0.1f, 0.1f}, 32.0f};
     objects.csg_sphere_materials[3] = {{0.2f, 0.8f, 0.2f}, {1.0f, 1.0f, 1.0f}, {0.1f, 0.1f, 0.1f}, 32.0f};
-    
+
+    // Rebuild the BVH after resetting the scene
+    build_bvh();
 }
 
 void scene_data::add_sphere(const glm::vec3& position, const float radius)
@@ -197,6 +235,9 @@ void scene_data::add_plane(const glm::vec3& position, const glm::vec3& normal)
     {
         objects.planes[objects.num_planes] = {position, normal};
         objects.num_planes++;
+
+        // Rebuild BVH when adding a new object
+        build_bvh();
     }
     else
     {
@@ -210,6 +251,9 @@ void scene_data::add_triangle(const glm::vec3& v1, const glm::vec3& v2, const gl
     {
         objects.triangles[objects.num_triangles] = {v1, v2, v3};
         objects.num_triangles++;
+
+        // Rebuild BVH when adding a new object
+        build_bvh();
     }
     else
     {
@@ -223,6 +267,9 @@ void scene_data::update_csg_spheres(const std::array<csg_sphere_data, MAX_CSG_SP
     {
         objects.csg_spheres[i] = csg_spheres[i];
     }
+
+    // Rebuild BVH when adding a new object
+    build_bvh();
 }
 
 
