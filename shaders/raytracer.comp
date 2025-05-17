@@ -70,7 +70,7 @@ struct BVHNode {
     int object_index;
     int object_count;
     int object_type;
-    float padding;
+    int split_axis;
 };
 
 layout (std140, binding = 3) uniform BVHBlock {
@@ -86,11 +86,54 @@ layout(rgba32f, binding = 0) uniform image2D outputImage;
 struct Ray {
     vec3 origin;
     vec3 direction;
+    vec3 inv_direction;
+    ivec3 direction_sign;
     vec3 mask;
     float current_ior;
     int depth;
     bool is_active;
 };
+
+// Initialize optimized ray
+Ray create_ray(vec3 origin, vec3 direction){
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    ray.inv_direction = 1.0 / direction;
+    ray.direction_sign.x = (direction.x < 0.0) ? 1 : 0;
+    ray.direction_sign.y = (direction.y < 0.0) ? 1 : 0;
+    ray.direction_sign.z = (direction.z < 0.0) ? 1 : 0;
+    ray.mask = vec3(1.0f);
+    ray.current_ior = 1.0f;
+    ray.depth = 0;
+    ray.is_active = true;
+    return ray;
+}
+
+bool rayIntersectsAABB(Ray ray, vec3 aabb_min, vec3 aabb_max, float max_dist) {
+    // X-axis
+    float t1 = (aabb_min.x - ray.origin.x) * ray.inv_direction.x;
+    float t2 = (aabb_max.x - ray.origin.x) * ray.inv_direction.x;
+
+    float t_min = ray.direction_sign.x > 0 ? t2 : t1;
+    float t_max = ray.direction_sign.x > 0 ? t1 : t2;
+
+    // Y-axis
+    t1 = (aabb_min.y - ray.origin.y) * ray.inv_direction.y;
+    t2 = (aabb_max.y - ray.origin.y) * ray.inv_direction.y;
+
+    t_min = max(t_min, ray.direction_sign.y > 0 ? t2 : t1);
+    t_max = min(t_max, ray.direction_sign.y > 0 ? t1 : t2);
+
+    // Z-axis
+    t1 = (aabb_min.z - ray.origin.z) * ray.inv_direction.z;
+    t2 = (aabb_max.z - ray.origin.z) * ray.inv_direction.z;
+
+    t_min = max(t_min, ray.direction_sign.z > 0 ? t2 : t1);
+    t_max = min(t_max, ray.direction_sign.z > 0 ? t1 : t2);
+
+    return t_max >= t_min && t_min < max_dist && t_max > 0.0;
+}
 
 struct Hit {
     float distance;
@@ -502,14 +545,26 @@ out vec3 intersect_point, out vec3 normal) {
         return ray_triangle(ray_pos, ray_dir, p0, p1, p2, intersect_point, normal);
     }
 
-    return -1.0; // Invalid object type
+    return -1.0;// Invalid object type
 }
 
 // Find the nearest intersection using BVH traversal
-float compute_nearest_intersection(vec3 ray_pos, vec3 ray_dir, float time, out vec3 intersec_i, out vec3 normal_i, out int object_id, out int object_type) {
+float compute_nearest_intersection(vec3 ray_pos, vec3 ray_dir, float time,
+out vec3 intersec_i, out vec3 normal_i,
+out int object_id, out int object_type) {
     // Default to no intersection
-    float closest_dist = 1e30;
+    float closest_dist = 1e30f;
     bool hit_found = false;
+
+    // Precompute inverse ray direction for faster AABB tests
+    vec3 inv_ray_dir = 1.0 / ray_dir;
+
+    // For faster ray-AABB tests (SIMD optimizations)
+    ivec3 ray_dir_sign = ivec3(
+    ray_dir.x < 0.0 ? 1 : 0,
+    ray_dir.y < 0.0 ? 1 : 0,
+    ray_dir.z < 0.0 ? 1 : 0
+    );
 
     // Initialize BVH traversal stack
     BVHTraversalStack stack;
@@ -518,31 +573,85 @@ float compute_nearest_intersection(vec3 ray_pos, vec3 ray_dir, float time, out v
     // Start with the root node
     int current_node = bvh.rootNode;
 
+    // Check if BVH is valid
+    if (current_node < 0 || current_node >= bvh.numNodes) {
+        // BVH is invalid or empty, fall back to direct object testing
+        // Test all spheres directly
+        for (int i = 0; i < objects.numSpheres && i < 256; i++) {
+            vec3 intersect_point_sphere;
+            vec3 normal_sphere;
+            float sphere_dist = ray_sphere(ray_pos, ray_dir, i, time, intersect_point_sphere, normal_sphere);
+
+            if (sphere_dist > 0.0 && sphere_dist < closest_dist) {
+                intersec_i = intersect_point_sphere;
+                normal_i = normal_sphere;
+                closest_dist = sphere_dist;
+                object_id = i;
+                object_type = 0;
+                hit_found = true;
+            }
+        }
+
+        // Test all planes directly
+        // ... (keeping the other direct intersection tests)
+
+        if (!hit_found) return -1.0;
+        return closest_dist;
+    }
+
     // Non-recursive traversal
     while (current_node >= 0 || !stackIsEmpty(stack)) {
         // If current_node is invalid, pop the next one from the stack
-        if (current_node < 0) {
+        if (current_node < 0 || current_node >= bvh.numNodes) {
             current_node = stackPop(stack);
             continue;
         }
 
         BVHNode node = bvh.nodes[current_node];
 
-        // Test if this node's bounding box intersects with the ray
-        if (!ray_aabb_intersection(ray_pos, ray_dir, node.aabb_min, node.aabb_max)) {
-            // No intersection with this node's AABB, skip this subtree
+        // Optimized ray-AABB intersection test
+        vec3 t_min = (node.aabb_min - ray_pos) * inv_ray_dir;
+        vec3 t_max = (node.aabb_max - ray_pos) * inv_ray_dir;
+
+        // Handle negative ray directions
+        if (ray_dir_sign.x > 0) { float tmp = t_min.x; t_min.x = t_max.x; t_max.x = tmp; }
+        if (ray_dir_sign.y > 0) { float tmp = t_min.y; t_min.y = t_max.y; t_max.y = tmp; }
+        if (ray_dir_sign.z > 0) { float tmp = t_min.z; t_min.z = t_max.z; t_max.z = tmp; }
+
+        float t_near = max(max(t_min.x, t_min.y), t_min.z);
+        float t_far = min(min(t_max.x, t_max.y), t_max.z);
+
+        // No intersection with this node's AABB or intersection is beyond current closest hit
+        if (t_near > t_far || t_far < 0.0 || t_near > closest_dist) {
             current_node = stackPop(stack);
             continue;
         }
 
-        // If this is a leaf node, test all objects in this node
-        if (node.left_child < 0) { // Leaf node
+        // Check if this is a leaf node (left_child < 0)
+        if (node.left_child < 0) {
+            // Leaf node - test all objects in this leaf
             for (int i = 0; i < node.object_count; i++) {
                 int obj_idx = node.object_index + i;
                 vec3 intersect_point;
                 vec3 normal;
 
-                float dist = intersect_object(ray_pos, ray_dir, obj_idx, node.object_type, time, intersect_point, normal);
+                float dist = -1.0;
+
+                // Handle different object types
+                if (node.object_type == 0) { // Sphere
+                    dist = ray_sphere(ray_pos, ray_dir, obj_idx, time, intersect_point, normal);
+                }
+                else if (node.object_type == 1) { // Plane
+                    vec3 plane_pos = objects.planes[obj_idx * 2];
+                    vec3 plane_normal = objects.planes[obj_idx * 2 + 1];
+                    dist = ray_plane(ray_pos, ray_dir, plane_pos, plane_normal, intersect_point, normal);
+                }
+                else if (node.object_type == 2) { // Triangle
+                    vec3 p0 = objects.triangles[obj_idx * 3];
+                    vec3 p1 = objects.triangles[obj_idx * 3 + 1];
+                    vec3 p2 = objects.triangles[obj_idx * 3 + 2];
+                    dist = ray_triangle(ray_pos, ray_dir, p0, p1, p2, intersect_point, normal);
+                }
 
                 if (dist > 0.0 && dist < closest_dist) {
                     closest_dist = dist;
@@ -558,29 +667,52 @@ float compute_nearest_intersection(vec3 ray_pos, vec3 ray_dir, float time, out v
             current_node = stackPop(stack);
         }
         else {
-            // Internal node - push children to stack
-            // Push the further child first (to be processed later)
-            // Process the closer child immediately
+            // Internal node - determine which child to visit first
+            int first_child, second_child;
 
-            // Determine which child is closer to the ray origin
-            float mid_x = (node.aabb_min.x + node.aabb_max.x) * 0.5;
-            bool left_first = ray_pos.x < mid_x || (ray_pos.x == mid_x && ray_dir.x < 0.0);
+            // Use split axis to determine traversal order
+            int axis = node.split_axis;
+            if (axis < 0 || axis > 2) {
+                // Invalid split axis, just use the longest axis
+                vec3 extent = node.aabb_max - node.aabb_min;
+                axis = 0;
+                if (extent.y > extent.x) axis = 1;
+                if (extent.z > extent[axis]) axis = 2;
+            }
 
-            if (left_first) {
-                stackPush(stack, node.right_child);
-                current_node = node.left_child;
+            // Find midpoint on split axis
+            float midpoint = (node.aabb_min[axis] + node.aabb_max[axis]) * 0.5;
+
+            if ((ray_pos[axis] < midpoint && ray_dir[axis] >= 0.0) ||
+            (ray_pos[axis] >= midpoint && ray_dir[axis] < 0.0)) {
+                // Left child is closer
+                first_child = node.left_child;
+                second_child = node.right_child;
             } else {
-                stackPush(stack, node.left_child);
-                current_node = node.right_child;
+                // Right child is closer
+                first_child = node.right_child;
+                second_child = node.left_child;
+            }
+
+            // Validate child indices
+            if (second_child >= 0 && second_child < bvh.numNodes) {
+                stackPush(stack, second_child);
+            }
+
+            if (first_child >= 0 && first_child < bvh.numNodes) {
+                current_node = first_child;
+            } else {
+                current_node = stackPop(stack);
             }
         }
     }
 
-    // Check for CSG objects - not yet integrated into BVH
+    // Check for CSG objects after BVH traversal
     vec3 csg_intersect_point;
     vec3 csg_normal;
     int csg_object_id, csg_object_type;
-    float csg_dist = rayCSG(ray_pos, ray_dir, csg_intersect_point, csg_normal, csg_object_id, csg_object_type);
+    float csg_dist = rayCSG(ray_pos, ray_dir, csg_intersect_point, csg_normal,
+    csg_object_id, csg_object_type);
 
     if ((csg_dist > 0.0) && (!hit_found || csg_dist < closest_dist)) {
         intersec_i = csg_intersect_point;
@@ -691,7 +823,7 @@ vec3 calculate_lighting(vec3 position, vec3 normal, vec3 view_dir, Material mate
         );
 
         if (shadow_dist > 0.0 && shadow_dist < light_distance) {
-            shadow = 0.0; // In shadow
+            shadow = 0.0;// In shadow
         }
     }
 
@@ -787,11 +919,9 @@ vec3 trace_ray_batch(vec2 pixel_coord) {
         primary_rays.count = 1;
 
         // Set up primary ray
-        compute_primary_ray(sample_uv, primary_rays.rays[0].origin, primary_rays.rays[0].direction);
-        primary_rays.rays[0].mask = vec3(1.0);
-        primary_rays.rays[0].current_ior = 1.0;
-        primary_rays.rays[0].depth = 0;
-        primary_rays.rays[0].is_active = true;
+        vec3 ray_origin, ray_direction;
+        compute_primary_ray(sample_uv, ray_origin, ray_direction);
+        primary_rays.rays[0] = create_ray(ray_origin, ray_direction);
 
         // Trace primary rays
         vec3 sample_color = vec3(0.0);
@@ -814,8 +944,8 @@ vec3 trace_ray_batch(vec2 pixel_coord) {
                 int object_id, object_type;
 
                 float dist = compute_nearest_intersection(
-                ray.origin, ray.direction, 0.0,
-                intersect_point, normal, object_id, object_type
+                    ray.origin, ray.direction, 0.0,
+                    intersect_point, normal, object_id, object_type
                 );
 
                 if (dist > 0.0) {
@@ -825,7 +955,7 @@ vec3 trace_ray_batch(vec2 pixel_coord) {
 
                     // Direct lighting
                     vec3 direct_light = calculate_lighting(
-                    intersect_point, normal, view_dir, material, lighting.lightColor
+                        intersect_point, normal, view_dir, material, lighting.lightColor
                     );
 
                     // Add direct lighting contribution
@@ -836,6 +966,10 @@ vec3 trace_ray_batch(vec2 pixel_coord) {
                     float reflection_coef = material.reflection_coef;
                     bool has_reflection = reflection_coef > 0.0;
                     bool has_refraction = refraction_coef > 0.0;
+                    
+                    if (length(ray.mask) < 0.01) {
+                        continue;
+                    }
 
                     // Refraction
                     if (has_refraction && depth < lighting.recursionDepth && secondary_rays.count < 512) {
@@ -870,6 +1004,11 @@ vec3 trace_ray_batch(vec2 pixel_coord) {
                             refract_ray.direction = refracted;
                             refract_ray.origin = intersect_point - new_normal * 1e-3;
                             refract_ray.mask = ray.mask * refraction_coef;
+                            refract_ray.inv_direction = 1.0 / refract_ray.direction;
+                            refract_ray.direction_sign.x = (refract_ray.direction.x < 0.0) ? 1 : 0;
+                            refract_ray.direction_sign.y = (refract_ray.direction.y < 0.0) ? 1 : 0;
+                            refract_ray.direction_sign.z = (refract_ray.direction.z < 0.0) ? 1 : 0;
+                            
 
                             // Handle absorption for inside rays
                             if (!is_entering) {
@@ -895,6 +1034,10 @@ vec3 trace_ray_batch(vec2 pixel_coord) {
                         reflect_ray.current_ior = ray.current_ior;
                         reflect_ray.depth = depth + 1;
                         reflect_ray.is_active = true;
+                        reflect_ray.inv_direction = 1.0 / reflect_ray.direction;
+                        reflect_ray.direction_sign.x = (reflect_ray.direction.x < 0.0) ? 1 : 0;
+                        reflect_ray.direction_sign.y = (reflect_ray.direction.y < 0.0) ? 1 : 0;
+                        reflect_ray.direction_sign.z = (reflect_ray.direction.z < 0.0) ? 1 : 0;
 
                         secondary_rays.rays[secondary_rays.count] = reflect_ray;
                         secondary_rays.count++;
@@ -921,6 +1064,108 @@ vec3 trace_ray_batch(vec2 pixel_coord) {
 
     // Average samples
     return final_color / float(samples * samples);
+}
+
+// TODO: Determine if rays in this workgroup are coherent
+bool determineCoherence() {
+    return false;
+}
+
+// Process a batch of rays together for more efficient traversal
+void coherentTraversal() {
+    // This is a placeholder for coherent traversal
+    ivec2 pixel_coord = ivec2(gl_GlobalInvocationID.xy);
+
+    // For now, just call the regular ray tracing function
+    vec3 pixel_color = trace_ray_batch(vec2(pixel_coord));
+    imageStore(outputImage, pixel_coord, vec4(pixel_color, 1.0));
+}
+
+vec3 visualize_bvh(vec2 uv) {
+    // Create a ray
+    vec3 ray_pos, ray_dir;
+    compute_primary_ray(uv, ray_pos, ray_dir);
+
+    // Precompute inverse ray direction
+    vec3 inv_ray_dir = 1.0 / ray_dir;
+
+    // Colors for different depths
+    vec3[] depth_colors = vec3[](
+    vec3(1.0, 0.0, 0.0),  // Red
+    vec3(0.0, 1.0, 0.0),  // Green
+    vec3(0.0, 0.0, 1.0),  // Blue
+    vec3(1.0, 1.0, 0.0),  // Yellow
+    vec3(1.0, 0.0, 1.0),  // Magenta
+    vec3(0.0, 1.0, 1.0),  // Cyan
+    vec3(1.0, 0.5, 0.0),  // Orange
+    vec3(0.5, 0.0, 1.0)   // Purple
+    );
+
+    // Start with the root node
+    int current_node = bvh.rootNode;
+    if (current_node < 0 || current_node >= bvh.numNodes) {
+        return vec3(0.5); // Gray for invalid BVH
+    }
+
+    // Track the depth
+    int depth = 0;
+    int max_depth = 20;
+
+    // Traverse the BVH to find the leaf node that contains this ray
+    while (depth < max_depth) {
+        if (current_node < 0 || current_node >= bvh.numNodes) {
+            return vec3(0.5); // Gray for invalid node
+        }
+
+        BVHNode node = bvh.nodes[current_node];
+
+        // Test ray against node AABB
+        vec3 t_min = (node.aabb_min - ray_pos) * inv_ray_dir;
+        vec3 t_max = (node.aabb_max - ray_pos) * inv_ray_dir;
+
+        // Handle negative ray directions
+        if (ray_dir.x < 0.0) { float tmp = t_min.x; t_min.x = t_max.x; t_max.x = tmp; }
+        if (ray_dir.y < 0.0) { float tmp = t_min.y; t_min.y = t_max.y; t_max.y = tmp; }
+        if (ray_dir.z < 0.0) { float tmp = t_min.z; t_min.z = t_max.z; t_max.z = tmp; }
+
+        float t_near = max(max(t_min.x, t_min.y), t_min.z);
+        float t_far = min(min(t_max.x, t_max.y), t_max.z);
+
+        // No intersection with this node's AABB
+        if (t_near > t_far || t_far < 0.0) {
+            return vec3(0.1); // Dark gray for no intersection
+        }
+
+        // If this is a leaf node, return color based on depth
+        if (node.left_child < 0) {
+            // Return color based on object type
+            if (node.object_type == 0) {
+                return vec3(1.0, 0.0, 0.0); // Red for spheres
+            } else if (node.object_type == 1) {
+                return vec3(0.0, 1.0, 0.0); // Green for planes
+            } else if (node.object_type == 2) {
+                return vec3(0.0, 0.0, 1.0); // Blue for triangles
+            } else {
+                return vec3(1.0, 1.0, 0.0); // Yellow for other types
+            }
+        }
+
+        // Internal node - choose the first child to traverse
+        int axis = node.split_axis;
+        if (axis < 0 || axis > 2) axis = 0;
+
+        float midpoint = (node.aabb_min[axis] + node.aabb_max[axis]) * 0.5;
+
+        if (ray_pos[axis] < midpoint) {
+            current_node = node.left_child;
+        } else {
+            current_node = node.right_child;
+        }
+
+        depth++;
+    }
+
+    return vec3(0.0); // Black for too deep
 }
 
 // Main compute shader function

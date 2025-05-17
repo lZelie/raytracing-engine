@@ -29,7 +29,7 @@ namespace gl3
         // ImGui state
         bool show_ui = true;
         bool camera_mode = false;
-        bool use_compute_shader = false; // Flag to toggle between compute and fragment shader
+        bool use_compute_shader = true; // Flag to toggle between compute and fragment shader
 
         // Rendering state
         std::unique_ptr<shader_class> shader_program;

@@ -3,15 +3,23 @@ project(Raytracing1)
 
 set(CMAKE_CXX_STANDARD 23)
 
+# Set this globally to affect all library fetching
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build shared libraries" FORCE)
+
 #OpenGL
 find_package(OpenGL REQUIRED)
-include_directories( ${OPENGL_INCLUDE_DIRS} )
+include_directories(${OPENGL_INCLUDE_DIRS})
 
 #GLFW
 find_package(glfw QUIET)
 if (NOT glfw_found)
     include(FetchContent)
     FetchContent_Declare(GLFW GIT_REPOSITORY https://github.com/glfw/glfw.git)
+    # Force GLFW to build only the static library
+    set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(GLFW)
 endif ()
 
@@ -23,30 +31,30 @@ if (NOT glm_FOUND)
     FetchContent_MakeAvailable(GLM)
 endif ()
 
-# GLEW
-find_package(GLEW QUIET)
-if (NOT GLEW_FOUND)
-    include(FetchContent)
-    SET(BUILD_UTILS OFF)
-    FetchContent_Declare(
-            GLEW
-            URL            https://sourceforge.net/projects/glew/files/glew/2.1.0/glew-2.1.0.zip
-            SOURCE_DIR     ${CMAKE_SOURCE_DIR}/external/glew
-    )
-    FetchContent_GetProperties(glew)
-    if(NOT glew_POPULATED)
-        FetchContent_MakeAvailable(glew)
-        add_subdirectory(${CMAKE_SOURCE_DIR}/external/glew/build/cmake)
-    endif()
+# GLEW - Custom handling to ensure static linking
+include(FetchContent)
+FetchContent_Declare(
+        GLEW
+        URL https://sourceforge.net/projects/glew/files/glew/2.1.0/glew-2.1.0.zip
+        SOURCE_DIR ${CMAKE_SOURCE_DIR}/external/glew
+)
+FetchContent_GetProperties(GLEW)
+if(NOT glew_POPULATED)
+    FetchContent_MakeAvailable(GLEW)
 
-    # Create an alias target to make linking consistent
-    if(TARGET glew AND NOT TARGET GLEW::GLEW)
-        add_library(GLEW::GLEW ALIAS glew)
+    # We'll build GLEW manually to ensure it's built statically
+    file(GLOB GLEW_SOURCE_FILES "${CMAKE_SOURCE_DIR}/external/glew/src/*.c")
+    add_library(glew_static STATIC ${GLEW_SOURCE_FILES})
+    target_include_directories(glew_static PUBLIC ${CMAKE_SOURCE_DIR}/external/glew/include)
+
+    if(WIN32)
+        target_link_libraries(glew_static PUBLIC opengl32 glu32)
+        target_compile_definitions(glew_static PUBLIC -DGLEW_STATIC -DGLEW_NO_GLU)
+    else()
+        target_link_libraries(glew_static PUBLIC ${OPENGL_LIBRARIES})
+        target_compile_definitions(glew_static PUBLIC -DGLEW_STATIC)
     endif()
-    if(TARGET glew_s AND NOT TARGET GLEW::GLEW_S)
-        add_library(GLEW::GLEW_S ALIAS glew_s)
-    endif()
-endif (NOT GLEW_FOUND)
+endif()
 
 # ImGui
 include(FetchContent)
@@ -90,10 +98,21 @@ add_executable(Raytracing1 main.cpp
         bvh.cpp
         bvh.h
 )
-target_include_directories(Raytracing1 PRIVATE "${CMAKE_SOURCE_DIR}/include" external/glew/include)
-target_link_libraries(Raytracing1 ${OPENGL_LIBRARY} glfw glm::glm-header-only GLEW::GLEW_S imgui)
+target_include_directories(Raytracing1 PRIVATE "${CMAKE_SOURCE_DIR}/include" ${CMAKE_SOURCE_DIR}/external/glew/include)
+target_link_libraries(Raytracing1 ${OPENGL_LIBRARY} glfw glm::glm-header-only glew_static imgui)
 
-# Copy shaders to the target output directory (preserving your existing build directory structure)
+# Apply static linking for C++ runtime libraries to the final executable
+if(MSVC)
+    target_compile_options(Raytracing1 PRIVATE /MT$<$<CONFIG:Debug>:d>)
+    set_property(TARGET Raytracing1 PROPERTY
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+elseif(MINGW)
+    target_link_options(Raytracing1 PRIVATE -static -static-libgcc -static-libstdc++)
+elseif(UNIX AND NOT APPLE)
+    target_link_options(Raytracing1 PRIVATE -static-libgcc -static-libstdc++)
+endif()
+
+# Copy shaders to the target output directory
 add_custom_command(
         TARGET Raytracing1 POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory

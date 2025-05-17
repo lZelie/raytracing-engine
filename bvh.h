@@ -3,6 +3,9 @@
 #include "scene_data.h"
 #include "glm/vec3.hpp"
 
+// Maximum depth for BVH construction
+constexpr auto MAX_BVH_DEPTH = 25;
+
 // Structure to hold object reference during bvh construction
 struct object_ref
 {
@@ -38,6 +41,12 @@ private:
         int start, int end,
         glm::vec3& out_min,
         glm::vec3& out_max);
+
+    // Calculate the surface area of a bounding box
+    static float calculate_surface_area(const glm::vec3& min, const glm::vec3& max);
+
+    // Optimize BVH for cache locality
+    static void optimize_bvh_for_cache(std::vector<scene_data::bvh_node>& nodes);
 };
 
 

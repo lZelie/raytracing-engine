@@ -174,17 +174,23 @@ public:
         int object_index = -1; // First object index in this leaf
         int object_count = 0; // Number of objects in this leaf
         int object_type = -1; // Object type (0 = sphere, 1 = plane, 2 = triangle, 3=CSG)
-        float padding = 0.0f; // Padding for alignment
+        int split_axis = -1; // Split axis for internal nodes, -1 for leaf nodes
 
         // Constructor for internal nodes
-        bvh_node(const glm::vec3& min, const glm::vec3& max, const int left, const int right) : aabb_min(min),
-            left_child(left), aabb_max(max), right_child(right)
+        bvh_node(const glm::vec3& min, const glm::vec3& max, const int left, const int right) : 
+            aabb_min(min), left_child(left), aabb_max(max), right_child(right)
         {
+            // For internal nodes, set object-related fields to invalid values
+            object_index = -1;
+            object_count = 0;
+            object_type = -1;
+            split_axis = 0; // Default to x-axis split
         }
 
         // Constructor for leaf nodes
         bvh_node(const glm::vec3& min, const glm::vec3& max, const int index, const int count, const int type) :
-            aabb_min(min), aabb_max(max), object_index(index), object_count(count), object_type(type)
+            aabb_min(min), aabb_max(max), left_child(-1), right_child(-1), 
+            object_index(index), object_count(count), object_type(type), split_axis(-1)
         {
         }
 

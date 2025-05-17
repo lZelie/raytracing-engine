@@ -113,18 +113,22 @@ void scene_data::update_UBOs() const
 void scene_data::build_bvh()
 {
     // Build the BVH using the bvh builder
-    std::vector<bvh_node> nodes = bvh_builder::build_bvh(objects.spheres, objects.num_spheres, objects.planes, objects.num_planes, objects.triangles, objects.num_triangles, objects.csg_spheres);
+    std::vector<bvh_node> nodes = bvh_builder::build_bvh(objects.spheres, objects.num_spheres, 
+        objects.planes, objects.num_planes, objects.triangles, objects.num_triangles, 
+        objects.csg_spheres);
 
     // Copy the nodes to the BVH data
     bvh.num_nodes = std::min(static_cast<int>(nodes.size()), MAX_BVH_NODES);
-    bvh.root_node = 0;
+    
+    // Always set root to 0 if we have nodes
+    bvh.root_node = bvh.num_nodes > 0 ? 0 : -1;
 
     for (int i = 0; i < bvh.num_nodes; i++)
     {
         bvh.nodes[i] = nodes[i];
     }
 
-    std::cout << "BVH built with " << bvh.num_nodes << " nodes" << std::endl;
+    std::cout << "BVH built with " << bvh.num_nodes << " nodes and root at " << bvh.root_node << std::endl;
 }
 
 void scene_data::reset_to_default()
@@ -137,7 +141,7 @@ void scene_data::reset_to_default()
     camera.time_samples = 1;
 
     camera.focal_distance = 15.0f;
-    camera.aperture_size = 0.3f;  // A moderate DOF effect
+    camera.aperture_size = 0.0f;  // A moderate DOF effect
 
     // Reset object counters
     objects.num_spheres = 5;
